@@ -15,8 +15,8 @@ def calculate_entitlement(employee: EmployeeProfile, leave_type: LeaveType) -> f
     
     # If leave_type is EL (Earned Leave), it accrues monthly based on service period.
     elif leave_type.code == 'EL':
-        # Assumption: Accrual is 1.5 days per month of service.
-        # In a real scenario, this requires fetching service period from EmployeeProfile/ERP.
+        # NOTE: Currently returns a hardcoded 18.0 as service duration is unavailable.
+        # The 1.5 days/month formula is an assumption requiring business confirmation.
         return 18.0 # Placeholder
         
     # If leave_type is VL (Vacation Leave), fixed annual entitlement.

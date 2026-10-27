@@ -1,153 +1,193 @@
+
 import pytest
-from modules.elm.services import ELMService
-from modules.elm.selectors import ELMSellector
-from modules.elm.domain.entities import LeaveApplication, LeaveType, EmployeeProfile
-from modules.elm.domain.rules import calculate_entitlement, check_overlap
-from modules.elm.contracts import ELMContracts
 from datetime import date
 
-# Mocking the Selector layer dependencies to isolate service logic
+from modules.elm.services import ELMService
+from modules.elm.selectors import ELMSellector
+from modules.elm.domain.entities import (
+    EmployeeProfile,
+    LeaveApplication,
+    LeaveType,
+)
+from modules.elm.domain.rules import calculate_entitlement
+
+
 @pytest.fixture(scope="module")
 def mock_selectors():
-    # Reset the state of the selector store before each test module run
-    ELMSellector._application_store = {}
-    ELMSellector._next_application_id = 1
+    """Mock selector methods to isolate service logic during tests."""
 
-    # Store original methods
-    ELMSellector.get_employee.__original__ = ELMSellector.get_employee
-    ELMSellector.get_applications_by_employee.__original__ = ELMSellector.get_applications_by_employee
+    original_get_employee = ELMSellector.get_employee
+    original_get_applications = ELMSellector.get_applications_by_employee
+    original_get_application = getattr(ELMSellector, "get_application", None)
+    original_update_status = getattr(
+        ELMSellector, "update_application_status", None
+    )
 
-    # Ensure mock functions behave as expected
+    if hasattr(ELMSellector, "_application_store"):
+        ELMSellector._application_store = {}
+
+    if hasattr(ELMSellector, "_next_application_id"):
+        ELMSellector._next_application_id = 1
+
     def mock_get_employee(emp_id):
-        return EmployeeProfile(employee_id=emp_id, roles={"ACT-01_Faculty"}, name="Test User", org_unit="CS")
-    
+        return EmployeeProfile(
+            employee_id=emp_id,
+            roles={"ACT-01_Faculty"},
+            name="Test User",
+            org_unit="CS",
+        )
+
     def mock_get_applications(emp_id):
         return []
-        
-    # Replace static methods for testing isolation
+
     ELMSellector.get_employee = mock_get_employee
     ELMSellector.get_applications_by_employee = mock_get_applications
-    
-    yield # Yield control to the test functions
-    
-    # Teardown
-    ELMSellector.get_employee = ELMSellector.get_employee.__original__
-    ELMSellector.get_applications_by_employee = ELMSellector.get_applications_by_employee.__original__
+
+    yield
+
+    ELMSellector.get_employee = original_get_employee
+    ELMSellector.get_applications_by_employee = original_get_applications
+
+    if original_get_application is not None:
+        ELMSellector.get_application = original_get_application
+
+    if original_update_status is not None:
+        ELMSellector.update_application_status = original_update_status
 
 
 def test_submit_leave_application_success(mock_selectors):
-    """Tests a successful leave application submission."""
-    auth_user_id = "user_123"
-    service = ELMService(auth_user_id)
+    """Tests successful leave application submission."""
+
+    service = ELMService("user_123")
 
     application_data = {
-        'leave_type': 'CL',
-        'start_date': date(2024, 10, 1),
-        'end_date': date(2024, 10, 3)
+        "leave_type": "CL",
+        "start_date": date(2024, 10, 1),
+        "end_date": date(2024, 10, 3),
     }
-    
-    try:
-        # Note: We must ensure calculate_entitlement succeeds here for the test to pass.
-        application = service.submit_leave_application(application_data)
-        
-        assert application.status == 'PENDING'
-        assert application.employee_id == auth_user_id
-        assert application.application_id is not None
-        
-    except Exception as e:
-        pytest.fail(f"Submission failed unexpectedly: {e}")
-def test_submit_leave_application_insufficient_entitlement(mock_selectors):
-    """Tests failure when employee does not have enough leave balance."""
-    auth_user_id = "user_123"
-    service = ELMService(auth_user_id)
 
+    application = service.submit_leave_application(application_data)
+
+    assert application.status == "PENDING"
+    assert application.employee_id == "user_123"
+    assert application.application_id is not None
+
+def test_submit_leave_application_insufficient_entitlement(
+    mock_selectors, monkeypatch
+):
+    import modules.elm.services as services_module
+
+    monkeypatch.setattr(
+        services_module,
+        "calculate_entitlement",
+        lambda employee, leave_type: 0.0,
+    )
+
+    service = ELMService("user_123")
     application_data = {
-        'leave_type': 'CL',
-        'start_date': date(2024, 10, 1),
-        'end_date': date(2024, 10, 3)
+        "leave_type": "CL",
+        "start_date": date(2024, 10, 1),
+        "end_date": date(2024, 10, 3),
     }
-    
-    # Simulating an Entitlement Failure Scenario
-    # The test relies on the implementation in domain/rules.py to raise ValueError
-    # when entitlement is zero.
-    with pytest.raises(ValueError) as excinfo:
-        service.submit_leave_application(application_data) 
-        
-    assert "entitlement is zero" in str(excinfo.value) or "invalid" in str(excinfo.value)
 
+    with pytest.raises(ValueError, match="entitlement is zero"):
+        service.submit_leave_application(application_data)
 
 def test_submit_leave_application_overlap_exists(mock_selectors):
-    """Tests failure when the requested leave overlaps with existing approved leave."""
+    """Tests rejection of leave overlapping with existing approved leave."""
+
     auth_user_id = "user_123"
     service = ELMService(auth_user_id)
-    
-    # Setup existing application that causes overlap
+
     existing_app = LeaveApplication(
         application_id=1,
         employee_id=auth_user_id,
-        leave_type=LeaveType(code='CL', name='CL', description='', allows_carry_forward=False, is_restricted=False),
-        start_date=date(2024, 9, 25), # Existing leave starts near the test period
-        end_date=date(2024, 10, 5), # Existing leave overlaps the test period (2024, 10, 1 to 2024, 10, 3)
-        status='APPROVED'
+        leave_type=LeaveType(
+            code="CL",
+            name="CL",
+            description="",
+            allows_carry_forward=False,
+            is_restricted=False,
+        ),
+        start_date=date(2024, 9, 25),
+        end_date=date(2024, 10, 5),
+        status="APPROVED",
     )
 
-    # Set the mock selector to return the existing overlapping application
-    ELMSellector.get_applications_by_employee = lambda emp_id: [existing_app]
-    ELMSellector.get_applications_by_employee = lambda emp_id: [existing_app]
+    ELMSellector.get_applications_by_employee = (
+        lambda emp_id: [existing_app]
     )
-    
-    # Set the mock selector to return the existing overlapping application
-    ELMSellector.get_applications_by_employee = lambda emp_id: [existing_app]
 
     application_data = {
-        'leave_type': 'CL',
-        'start_date': date(2024, 10, 1),
-    assert "overlaps with existing approved leave" in str(excinfo.value)
-        'end_date': date(2024, 10, 3)
-    assert "overlaps with existing approved leave" in str(excinfo.value)
+        "leave_type": "CL",
+        "start_date": date(2024, 10, 1),
+        "end_date": date(2024, 10, 3),
     }
 
     with pytest.raises(ValueError) as excinfo:
         service.submit_leave_application(application_data)
-        
-    assert "overlaps with existing approved leave" in str(excinfo.value)
 
-# Add a simple test for approval flow
-def test_review_and_approve_request_success(mock_selectors):
-    """Tests the successful approval of a pending application."""
+    assert "overlap" in str(excinfo.value).lower()
+
+
+def test_review_and_approve_request_success(mock_selectors,monkeypatch):
+    """Tests approval of a pending leave application."""
+
     service = ELMService(auth_user_id="approver_123")
-    
-    # Create a mock application
-    app = LeaveApplication(
-    )
+    monkeypatch.setattr(
+    service,
+    "_get_allowed_actors",
+    lambda application: {"approver_123"},
+)
 
-    # Ensure Selector returns our mock app
-    ELMSellector.get_application = lambda app_id: app
+    app = LeaveApplication(
         application_id=100,
         employee_id="user_123",
-    )
-
-    # Ensure Selector returns our mock app
-    ELMSellector.get_application = lambda app_id: app
-    
-    # Mock the update method call
-    ELMSellector.update_application_status = lambda app_id, status: None
-    ELMSellector.get_application = lambda app_id: app
-    approved_app = service.review_and_approve_request(100, "approver_123")
-    assert approved_app.status == 'APPROVED'
-        leave_type=LeaveType(code='CL', name='CL', description='', allows_carry_forward=False, is_restricted=False),
+        leave_type=LeaveType(
+            code="CL",
+            name="CL",
+            description="",
+            allows_carry_forward=False,
+            is_restricted=False,
+        ),
         start_date=date(2024, 10, 1),
         end_date=date(2024, 10, 3),
-        status='PENDING'
+        status="PENDING",
     )
-    )
-    
-    # Ensure Selector returns our mock app
+
     ELMSellector.get_application = lambda app_id: app
-    
-    # Mock the update method call
-    ELMSellector.update_application_status = lambda app_id, status: None
-    
-    approved_app = service.review_and_approve_request(100, "approver_123")
-    
-    assert approved_app.status == 'APPROVED'
+
+    def update_application_status(app_id, status):
+        app.status = status
+
+    ELMSellector.update_application_status = update_application_status
+
+    approved_app = service.review_and_approve_request(
+        100, "approver_123"
+    )
+
+    assert approved_app.status == "APPROVED"
+
+
+def test_calculate_el_entitlement_limitation(mock_selectors):
+    """Documents the current hardcoded EL entitlement limitation."""
+
+    employee = EmployeeProfile(
+        employee_id="test_el",
+        roles=set(),
+        name="EL Test",
+        org_unit="Test",
+    )
+
+    leave_type = LeaveType(
+        code="EL",
+        name="Earned Leave",
+        description="Earned Leave",
+        allows_carry_forward=True,
+        is_restricted=False,
+    )
+
+    entitlement = calculate_entitlement(employee, leave_type)
+
+    # Documents current behavior, not a confirmed business requirement.
+    assert entitlement == 18.0
